@@ -40,6 +40,7 @@ def patch_parallel_state():
             use_message_queue_broadcaster,
             group_name,
         )
+        self.use_hmc = True
 
     def vllm_het_send(
         self,
@@ -83,7 +84,7 @@ def patch_parallel_state():
                     and tensor.numel() % all_gather_size == 0):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
-            if self.use_uccl_p2p:
+            if self.use_hmc:
                 if tensor.is_cpu:
                     # self.clients[self.ranks[dst]].send_tensor(tensor)
                     torch.distributed.send(tensor,
@@ -150,7 +151,7 @@ def patch_parallel_state():
                     tensor = tensor.reshape(all_gather_size,
                                             -1)[all_gather_rank]
                 
-                if self.use_uccl_p2p:
+                if self.use_hmc:
                     if tensor.is_cpu:
                         torch.distributed.recv(tensor,
                                             src=self.ranks[src],
