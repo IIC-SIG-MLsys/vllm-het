@@ -1,0 +1,6 @@
+[submodule "thirdparty/nvidia_vllm_0_9_1"]
+	path = thirdparty/nvidia_vllm_0_9_1
+	url = https://github.com/vllm-project/vllm.git
+[submodule "thirdparty/amd_vllm_0_9_1"]
+	path = thirdparty/amd_vllm_0_9_1
+	url = https://github.com/ROCm/vllm.git
