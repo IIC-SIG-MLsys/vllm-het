@@ -10,13 +10,13 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 THIRDPARTY_ROOT = os.path.join(PROJECT_ROOT, "thirdparty")
 
 VENDOR_PATHS = {
-    "nvidia 0.9.1": os.path.join(THIRDPARTY_ROOT, "nvidia_vllm_0_9_1"),
-    "nvidia 0.8.5": os.path.join(THIRDPARTY_ROOT, "nvidia_vllm_0_8_5"),
-    "amd 0.9.1": os.path.join(THIRDPARTY_ROOT, "amd_vllm_0_9_1"),
+    "nvidia_0.9.1": os.path.join(THIRDPARTY_ROOT, "nvidia_vllm_0_9_1"),
+    "nvidia_0.8.5": os.path.join(THIRDPARTY_ROOT, "nvidia_vllm_0_8_5"),
+    "amd_0.9.1": os.path.join(THIRDPARTY_ROOT, "amd_vllm_0_9_1"),
     "hygon": os.path.join(THIRDPARTY_ROOT, "hygon_vllm_0_8_5_post1"),
 }
 
-_PROVIDER = os.environ.get("VLLM_VERSION_PROVIDER", "nvidia 0.9.1").lower()
+_PROVIDER = os.environ.get("VLLM_VERSION_PROVIDER", "nvidia_vllm_0_9_1").lower()
 if _PROVIDER not in VENDOR_PATHS:
     raise ValueError(f"Invalid MEGATRON_PROVIDER='{_PROVIDER}'")
 
@@ -35,7 +35,7 @@ def _init_vendor_submodules(vendor_root: str):
     """
     try:
         subprocess.check_call(
-            ["git", "submodule", "update", "--init", "--recursive"],
+            ["git", "submodule", "update", "--init", "--recursive", vendor_root],
             cwd=vendor_root,
         )
         print(f"[INFO] Git submodules initialized in {vendor_root}")
