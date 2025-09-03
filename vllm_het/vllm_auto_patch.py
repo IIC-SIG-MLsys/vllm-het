@@ -6,8 +6,7 @@ import torch.distributed
 from typing import Any, Callable, Optional, Union
 from torch.distributed import Backend, ProcessGroup
 from types import ModuleType
-import sys, time, traceback, importlib.util, importlib.abc
-# from .p2p_backend import init_p2p_comm, TCPComm, _HET_COMM
+import os, sys, time, traceback, importlib.util, importlib.abc
 
 logger = logging.getLogger("sitecustomize")
 logger.info("sitecustomize loaded, preparing vllm patch")
@@ -16,6 +15,8 @@ LOG_PATH = "/tmp/vllm_auto_patch.log"
 
 TARGET = "vllm.distributed.parallel_state"
 
+P2P_RANK_IP_CACHE = {}
+
 def log(msg):
     try:
         with open(LOG_PATH, "a") as f:
@@ -23,23 +24,44 @@ def log(msg):
     except Exception:
         pass
 
+def load_p2p_backend():
+    base_dir = os.path.dirname(__file__)
+    p2p_path = os.path.join(base_dir, "p2p_backend.py")
+    if not os.path.exists(p2p_path):
+        return None
+    # choose a unique module name to avoid colliding with other imports
+    module_name = "vllm_auto_patch__p2p_backend"
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, p2p_path)
+        module = importlib.util.module_from_spec(spec)
+        # optionally register in sys.modules so further imports by name find it
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        with open("/tmp/vllm_auto_patch.log", "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} load_p2p_backend_from_file failed:\n")
+            import traceback
+            f.write(traceback.format_exc() + "\n")
+        # make sure no half-loaded module remains
+        sys.modules.pop(module_name, None)
+        return None
+
+p2p = load_p2p_backend()
+if p2p == None:
+    log("import p2p error")
+    return None
+
 def apply_patch(mod: ModuleType):
     try:
         GC = getattr(mod, "GroupCoordinator", None)
         if GC is None:
             log("parallel_state.GroupCoordinator not found")
             return
-        orig_init = getattr(GC, "__init__", None)
-        if getattr(orig_init, "_patched_by_vllm_auto", False):
-            log("GroupCoordinator.__init__ already patched; skip")
-            return
 
-        # ======= 示例：仅演示如何替换；把你的 vllm_het_init/send/recv 放进来 =======
         orig_init = getattr(GC, "__init__", None)
         orig_send_tensor_dict = getattr(GC, "send_tensor_dict", None)
         orig_recv_tensor_dict = getattr(GC, "recv_tensor_dict", None)
-
-        # p2p = importlib.import_module("vllm.distributed.p2p_backend")
 
         def vllm_het_init(
             self,
@@ -60,9 +82,23 @@ def apply_patch(mod: ModuleType):
                 group_name,
             )
             self.use_hmc = True
-            # for ranks in group_ranks:
-            #     if self.rank in ranks:
-            #         init_p2p_comm(self.cpu_group, p2p_backend=default_backend)
+
+            if group_name == "world":
+                # print("group_name == world")
+                P2P_RANK_IP_CACHE["world"] = p2p.get_rank_ip_port_map(group = self.cpu_group)
+            elif group_name == "pp":
+                rank_ip = P2P_RANK_IP_CACHE.get("world", None)
+                # print("group_name == pp")
+                # print(self.cpu_group.group_name)
+                # print(
+                #     "[DEBUG] group=", getattr(self.cpu_group, "group_name", None),
+                #     " local_rank=", torch.distributed.get_rank(group=self.cpu_group),
+                #     " world_rank=", torch.distributed.get_rank(),
+                #     " rank_ip_type=", type(rank_ip).__name__,
+                #     " rankip_len=", (len(rank_ip) if hasattr(rank_ip, "__len__") else "NA"),
+                #     " rankip_keys=", (list(rank_ip.keys())[:8] if isinstance(rank_ip, dict) else "NA")
+                # )
+                p2p.init_p2p_comm(group = self.cpu_group, rankip = rank_ip)
 
         def vllm_het_send(
             self,
@@ -73,7 +109,6 @@ def apply_patch(mod: ModuleType):
             """Send the input tensor dictionary.
             NOTE: `dst` is the local rank of the source rank.
             """
-            print("\t\ncustomize send\t\n")
             # Bypass the function if we are using only 1 GPU.
             if not torch.distributed.is_initialized() or self.world_size == 1:
                 return tensor_dict
@@ -85,6 +120,8 @@ def apply_patch(mod: ModuleType):
 
             group = self.device_group
             metadata_group = self.cpu_group
+
+            print(metadata_group.group_name)
 
             if dst is None:
                 dst = (self.rank_in_group + 1) % self.world_size
@@ -108,15 +145,9 @@ def apply_patch(mod: ModuleType):
 
                 if self.use_hmc:
                     if tensor.is_cpu:
-                        # self.clients[self.ranks[dst]].send_tensor(tensor)
-                        torch.distributed.send(tensor,
-                                            dst=self.ranks[dst],
-                                            group=metadata_group)
+                        p2p._HET_COMM[metadata_group.group_name].send(tensor, dst=self.ranks[dst])
                     else:
-                        cpu_tensor = tensor.cpu()
-                        torch.distributed.send(cpu_tensor,
-                                            dst=self.ranks[dst],
-                                            group=metadata_group)
+                        p2p._HET_COMM[metadata_group.group_name].send(tensor, dst=self.ranks[dst])
                 else:
                     if tensor.is_cpu:
                         # use metadata_group for CPU tensors
@@ -134,9 +165,8 @@ def apply_patch(mod: ModuleType):
             self,
             src: Optional[int] = None,
             all_gather_group: Optional["GroupCoordinator"] = None,
-        ) -> Optional[dict[str, Union[torch.Tensor, Any]]]:
-            
-            print("\t\ncustomize recv\t\n")
+        ) -> Optional[dict[str, Union[torch.Tensor, Any]]]:   
+            # print("\t\ncustomize recv\t\n")
             if not torch.distributed.is_initialized() or self.world_size == 1:
                 return None
 
@@ -147,6 +177,8 @@ def apply_patch(mod: ModuleType):
 
             group = self.device_group
             metadata_group = self.cpu_group
+
+            print(metadata_group.group_name)
 
             if src is None:
                 src = (self.rank_in_group - 1) % self.world_size
@@ -175,16 +207,9 @@ def apply_patch(mod: ModuleType):
                     
                     if self.use_hmc:
                         if tensor.is_cpu:
-                            torch.distributed.recv(tensor,
-                                                src=self.ranks[src],
-                                                group=metadata_group)
+                            p2p._HET_COMM[metadata_group.group_name].recv(tensor, src=self.ranks[src])
                         else:
-                            cpu_tensor = torch.empty_like(tensor, device='cpu')
-                            torch.distributed.recv(cpu_tensor,
-                                                src=self.ranks[src],
-                                                group=metadata_group)
-                            device = torch.device(f'cuda:{self.local_rank}')
-                            tensor = cpu_tensor.to(device)
+                            p2p._HET_COMM[metadata_group.group_name].recv(tensor, src=self.ranks[src])
                     else:
                         if tensor.is_cpu:
                             # use metadata_group for CPU tensors
@@ -238,7 +263,6 @@ class _Finder(importlib.abc.MetaPathFinder):
 
         orig_loader = spec.loader
 
-        # 如果已经被我们或其它逻辑包了一次，就别包两次
         if getattr(orig_loader, "_wrapped_by_vllm_auto", False):
             return spec
 
@@ -249,15 +273,12 @@ class _Finder(importlib.abc.MetaPathFinder):
                 return None
 
             def exec_module(self, module):
-                # 先让原始 loader 加载模块
                 orig_loader.exec_module(module)
-                # 然后在模块加载完成后应用补丁
                 try:
                     apply_patch(module)
                 except Exception:
                     log("apply_patch failed in Loader.exec_module:\n" + traceback.format_exc())
 
-        # 标记以避免重复包装（对 orig_loader 做标记）
         try:
             setattr(orig_loader, "_wrapped_by_vllm_auto", True)
         except Exception:
