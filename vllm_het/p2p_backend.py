@@ -244,7 +244,7 @@ def init_p2p_comm(group: torch.distributed.ProcessGroup = None, p2p_backend: P2p
         return
     if p2p_backend == P2pBackend.HMCComm:
         # print(f"Init p2p HMCComm for group {group.group_name}")
-        _HET_COMM[group.group_name] = HMCComm(rank=dist.get_rank(), rank_ip = get_rank_ip_port_map(group))
+        _HET_COMM[group.group_name] = HMCComm(rank=dist.get_rank(), rank_ip = rankip)
     elif p2p_backend == P2pBackend.TCPComm:
         # print(f"Init p2p TCPComm for group {group.group_name}")
         _HET_COMM[group.group_name] = TCPComm(rank=dist.get_rank(), rank_ip = rankip)
