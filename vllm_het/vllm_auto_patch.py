@@ -4,9 +4,11 @@ import logging
 import torch
 import torch.distributed
 from typing import Any, Callable, Optional, Union
-from torch.distributed import Backend, ProcessGroup
+from torch.distributed import Backend, ProcessGroup, ReduceOp
 from types import ModuleType
 import os, sys, time, traceback, importlib.util, importlib.abc
+# from vllm.distributed.device_communicators.pynccl_wrapper import NCCLLibrary, ncclUniqueId
+# from vllm.distributed.utils import StatelessProcessGroup
 
 logger = logging.getLogger("sitecustomize")
 logger.info("sitecustomize loaded, preparing vllm patch")
@@ -16,6 +18,12 @@ LOG_PATH = "/tmp/vllm_auto_patch.log"
 TARGET = "vllm.distributed.parallel_state"
 
 P2P_RANK_IP_CACHE = {}
+
+_EXTRA_PATCHES = {
+    "vllm.distributed.parallel_state": "patch_parallel_state",
+    "vllm.utils": "patch_vllm_utils",
+    "vllm.distributed.device_communicators.pynccl": "patch_pynccl_init",
+}
 
 def log(msg):
     try:
@@ -39,6 +47,7 @@ def load_p2p_backend():
         spec.loader.exec_module(module)
         return module
     except Exception:
+        print("\n\n\nimport error\n\n\n")
         with open("/tmp/vllm_auto_patch.log", "a") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} load_p2p_backend_from_file failed:\n")
             import traceback
@@ -49,10 +58,10 @@ def load_p2p_backend():
 
 p2p = load_p2p_backend()
 if p2p == None:
-    log("import p2p error")
-    return None
+    print("\n\n\nimport error\n\n\n")
 
-def apply_patch(mod: ModuleType):
+
+def patch_parallel_state(mod: ModuleType):
     try:
         GC = getattr(mod, "GroupCoordinator", None)
         if GC is None:
@@ -84,20 +93,20 @@ def apply_patch(mod: ModuleType):
             self.use_hmc = True
 
             if group_name == "world":
-                # print("group_name == world")
+                print("group_name == world")
                 P2P_RANK_IP_CACHE["world"] = p2p.get_rank_ip_port_map(group = self.cpu_group)
             elif group_name == "pp":
                 rank_ip = P2P_RANK_IP_CACHE.get("world", None)
-                # print("group_name == pp")
-                # print(self.cpu_group.group_name)
-                # print(
-                #     "[DEBUG] group=", getattr(self.cpu_group, "group_name", None),
-                #     " local_rank=", torch.distributed.get_rank(group=self.cpu_group),
-                #     " world_rank=", torch.distributed.get_rank(),
-                #     " rank_ip_type=", type(rank_ip).__name__,
-                #     " rankip_len=", (len(rank_ip) if hasattr(rank_ip, "__len__") else "NA"),
-                #     " rankip_keys=", (list(rank_ip.keys())[:8] if isinstance(rank_ip, dict) else "NA")
-                # )
+                print("group_name == pp")
+                print(self.cpu_group.group_name)
+                print(
+                    "[DEBUG] group=", getattr(self.cpu_group, "group_name", None),
+                    " local_rank=", torch.distributed.get_rank(group=self.cpu_group),
+                    " world_rank=", torch.distributed.get_rank(),
+                    " rank_ip_type=", type(rank_ip).__name__,
+                    " rankip_len=", (len(rank_ip) if hasattr(rank_ip, "__len__") else "NA"),
+                    " rankip_keys=", (list(rank_ip.keys())[:8] if isinstance(rank_ip, dict) else "NA")
+                )
                 p2p.init_p2p_comm(group = self.cpu_group, rankip = rank_ip)
 
         def vllm_het_send(
@@ -109,6 +118,7 @@ def apply_patch(mod: ModuleType):
             """Send the input tensor dictionary.
             NOTE: `dst` is the local rank of the source rank.
             """
+            print("\t\ncustomize send\t\n")
             # Bypass the function if we are using only 1 GPU.
             if not torch.distributed.is_initialized() or self.world_size == 1:
                 return tensor_dict
@@ -165,8 +175,9 @@ def apply_patch(mod: ModuleType):
             self,
             src: Optional[int] = None,
             all_gather_group: Optional["GroupCoordinator"] = None,
-        ) -> Optional[dict[str, Union[torch.Tensor, Any]]]:   
-            # print("\t\ncustomize recv\t\n")
+        ) -> Optional[dict[str, Union[torch.Tensor, Any]]]:
+            
+            print("\t\ncustomize recv\t\n")
             if not torch.distributed.is_initialized() or self.world_size == 1:
                 return None
 
@@ -241,17 +252,110 @@ def apply_patch(mod: ModuleType):
     except Exception:
         log("apply_patch failed:\n" + traceback.format_exc())
 
+def patch_vllm_utils(mod: ModuleType):
+    """
+    Wrap vllm.utils.update_environment_variables(envs)
+    - Default: behave like original, but log each change.
+    - If env VLLM_PATCH_ENV_SKIP=1: skip overwriting existing env vars (do not change os.environ if key exists).
+    - If env VLLM_PATCH_ENV_FORCE=1: force overwrite (same as original).
+    """
+    try:
+        orig = getattr(mod, "update_environment_variables", None)
+        if orig is None or not callable(orig):
+            log("vllm.utils.update_environment_variables not found; skipping patch")
+            return
+
+        def wrapped_update_environment_variables(envs: dict[str, str]):
+            for k, v in envs.items():
+                # Skip overwriting 'LD_LIBRARY_PATH'
+                if k == 'LD_LIBRARY_PATH':
+                    if k in os.environ and os.environ[k] != v:
+                        logger.warning(
+                            "Attempt to overwrite environment variable %s from '%s' to '%s' was skipped",
+                            k, os.environ[k], v
+                        )
+                    continue  # Skip the update if LD_LIBRARY_PATH is being changed
+                
+                # If the variable is different, log and update it
+                if k in os.environ and os.environ[k] != v:
+                    logger.warning(
+                        "Overwriting environment variable %s from '%s' to '%s'",
+                        k, os.environ[k], v
+                    )
+                
+                os.environ[k] = v
+            log("utils_init with new patch")
+
+        setattr(mod, "update_environment_variables", wrapped_update_environment_variables)
+        log("patch_vllm_utils applied")
+    except Exception:
+        log("patch_vllm_utils failed:\n" + traceback.format_exc())
+
+import torch.distributed as dist
+
+def patch_pynccl_init(mod: ModuleType):
+    """
+    Wrap PyNcclCommunicator.__init__ to optionally disable its initialization.
+    - If env VLLM_PATCH_DISABLE_PYNCCL=1, skip calling original __init__ and mark instance._pynccl_disabled = True.
+    - Otherwise call original __init__ and if it raises, catch, log, mark instance as disabled to avoid crash propagation.
+    The wrapper uses *args/**kwargs so it is robust to signature changes.
+    """
+    try:
+        PyNcclCommunicator = getattr(mod, "PyNcclCommunicator", None)
+        if PyNcclCommunicator is None:
+            log("pynccl.PyNcclCommunicator not found; skipping patch")
+            return
+
+        orig_init = getattr(PyNcclCommunicator, "__init__", None)
+        if orig_init is None:
+            log("PyNcclCommunicator.__init__ not found; skipping patch")
+            return
+
+        def wrapped_init(self, *args, **kwargs):
+            logger.info("user new PyNcclCommunicator init")
+
+        # replace the __init__ on the class
+        wrapped_init.__wrapped__ = orig_init
+        setattr(PyNcclCommunicator, "__init__", wrapped_init)
+        log("patch_pynccl_init applied")
+    except Exception:
+        log("patch_pynccl_init failed:\n" + traceback.format_exc())
 
 
-if TARGET in sys.modules:
-    apply_patch(sys.modules[TARGET])
+def _dispatch_patch_for_module(module: ModuleType):
+    name = getattr(module, "__name__", None)
+    if not name:
+        return
+    fn_name = _EXTRA_PATCHES.get(name)
+    if not fn_name:
+        return
+    fn = globals().get(fn_name)
+    if not fn:
+        log(f"Patch function {fn_name} for module {name} not found")
+        return
+    try:
+        log(f"Dispatching patch {fn_name} for module {name}")
+        fn(module)
+    except Exception:
+        log(f"Dispatch of {fn_name} for module {name} failed:\n" + traceback.format_exc())
 
+
+# If any target modules are already loaded, apply their patches immediately.
+for _mod_name in list(_EXTRA_PATCHES.keys()):
+    if _mod_name in sys.modules:
+        try:
+            _dispatch_patch_for_module(sys.modules[_mod_name])
+        except Exception:
+            log(f"initial dispatch for {_mod_name} failed:\n" + traceback.format_exc())
+
+
+# Meta-path finder that intercepts imports for any name in _EXTRA_PATCHES
 class _Finder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
-        if fullname != TARGET:
+        # Only intercept modules we've declared in _EXTRA_PATCHES
+        if fullname not in _EXTRA_PATCHES:
             return None
 
-        # 使用 PathFinder 做路径查找，避免再次走 sys.meta_path（防止递归）
         try:
             spec = importlib.machinery.PathFinder.find_spec(fullname, path)
         except Exception:
@@ -263,6 +367,7 @@ class _Finder(importlib.abc.MetaPathFinder):
 
         orig_loader = spec.loader
 
+        # already wrapped?
         if getattr(orig_loader, "_wrapped_by_vllm_auto", False):
             return spec
 
@@ -273,11 +378,13 @@ class _Finder(importlib.abc.MetaPathFinder):
                 return None
 
             def exec_module(self, module):
+                # let original loader load module first
                 orig_loader.exec_module(module)
+                # dispatch patch according to module name
                 try:
-                    apply_patch(module)
+                    _dispatch_patch_for_module(module)
                 except Exception:
-                    log("apply_patch failed in Loader.exec_module:\n" + traceback.format_exc())
+                    log("apply_patch_dispatch failed in Loader.exec_module:\n" + traceback.format_exc())
 
         try:
             setattr(orig_loader, "_wrapped_by_vllm_auto", True)
@@ -285,9 +392,11 @@ class _Finder(importlib.abc.MetaPathFinder):
             pass
 
         spec.loader = _Loader()
-        log("install loader wrapper for " + TARGET)
+        log("install loader wrapper for " + fullname)
         return spec
 
+
+# install finder if not already present
 if not any(isinstance(x, _Finder) for x in sys.meta_path):
     sys.meta_path.insert(0, _Finder())
     log("vllm_auto_patch: meta_path finder installed")
