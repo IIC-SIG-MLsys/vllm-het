@@ -7,8 +7,6 @@ from typing import Any, Callable, Optional, Union
 from torch.distributed import Backend, ProcessGroup, ReduceOp
 from types import ModuleType
 import os, sys, time, traceback, importlib.util, importlib.abc
-# from vllm.distributed.device_communicators.pynccl_wrapper import NCCLLibrary, ncclUniqueId
-# from vllm.distributed.utils import StatelessProcessGroup
 
 logger = logging.getLogger("sitecustomize")
 logger.info("sitecustomize loaded, preparing vllm patch")
@@ -93,20 +91,9 @@ def patch_parallel_state(mod: ModuleType):
             self.use_hmc = True
 
             if group_name == "world":
-                print("group_name == world")
                 P2P_RANK_IP_CACHE["world"] = p2p.get_rank_ip_port_map(group = self.cpu_group)
             elif group_name == "pp":
                 rank_ip = P2P_RANK_IP_CACHE.get("world", None)
-                print("group_name == pp")
-                print(self.cpu_group.group_name)
-                print(
-                    "[DEBUG] group=", getattr(self.cpu_group, "group_name", None),
-                    " local_rank=", torch.distributed.get_rank(group=self.cpu_group),
-                    " world_rank=", torch.distributed.get_rank(),
-                    " rank_ip_type=", type(rank_ip).__name__,
-                    " rankip_len=", (len(rank_ip) if hasattr(rank_ip, "__len__") else "NA"),
-                    " rankip_keys=", (list(rank_ip.keys())[:8] if isinstance(rank_ip, dict) else "NA")
-                )
                 p2p.init_p2p_comm(group = self.cpu_group, rankip = rank_ip)
 
         def vllm_het_send(
@@ -118,7 +105,7 @@ def patch_parallel_state(mod: ModuleType):
             """Send the input tensor dictionary.
             NOTE: `dst` is the local rank of the source rank.
             """
-            print("\t\ncustomize send\t\n")
+
             # Bypass the function if we are using only 1 GPU.
             if not torch.distributed.is_initialized() or self.world_size == 1:
                 return tensor_dict
@@ -130,8 +117,6 @@ def patch_parallel_state(mod: ModuleType):
 
             group = self.device_group
             metadata_group = self.cpu_group
-
-            print(metadata_group.group_name)
 
             if dst is None:
                 dst = (self.rank_in_group + 1) % self.world_size
@@ -177,7 +162,6 @@ def patch_parallel_state(mod: ModuleType):
             all_gather_group: Optional["GroupCoordinator"] = None,
         ) -> Optional[dict[str, Union[torch.Tensor, Any]]]:
             
-            print("\t\ncustomize recv\t\n")
             if not torch.distributed.is_initialized() or self.world_size == 1:
                 return None
 
