@@ -38,7 +38,7 @@ export VLLM_VERSION_PROVIDER=nvidia_0.9.1 (nvidia_0.9.1, amd_0.9.1)
 **主节点**
 
 ```bash
-ray start --head --num-cpus=n --num-gpus=n #指定使用的cpu和GPU数量
+ray start --head --port=端口号 --num-cpus=n --num-gpus=n #指定使用的cpu和GPU数量
 ```
 
 **其余节点**
@@ -54,7 +54,7 @@ Ray集群创建要求，所有节点的python版本和ray版本保持一致。
 ### vLLM 启动命令
 
 ```bash
- python3 -m vllm.entrypoints.openai.api_server   \
+VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server   \
         --model /root/.cache/huggingface/modelscope/hub/models/Qwen/Qwen2-7b   \ #替换为具体的模型路径（各节点模型路径保持一致）
         --port 8000   \
         --dtype half   \
