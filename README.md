@@ -6,6 +6,17 @@
 
 [GPU - vLLM 文档](https://docs.vllm.com.cn/en/latest/getting_started/installation/gpu.html#build-an-image-with-vllm)
 
+```bash
+docker run -d \
+    --entrypoint /bin/bash \
+    --network host \
+    --name vllm \
+    --shm-size 10.24g \
+    --gpus all \
+    -v /home/${user}/.cache:/root/.cache/huggingface \
+    vllm/vllm-openai:latest -c "tail -f /dev/null"
+```
+
 ### vllm-het
 
 **运行vllm-het**

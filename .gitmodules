@@ -4,6 +4,3 @@
 [submodule "thirdparty/amd_vllm_0_9_1"]
 	path = thirdparty/amd_vllm_0_9_1
 	url = https://github.com/ROCm/vllm.git
-[submodule "HMC"]
-	path = HMC
-	url = https://github.com/IIC-SIG-MLsys/HMC.git
